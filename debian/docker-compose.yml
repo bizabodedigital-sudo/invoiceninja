@@ -1,62 +1,115 @@
+version: "3.8"
+
 x-logging: &default-logging
+  driver: json-file
   options:
     max-size: "10m"
     max-file: "3"
-  driver: json-file
 
 services:
   app:
+    image: invoiceninja/invoiceninja-debian:${TAG:-latest}   # use official image
+    restart: unless-stopped
     env_file:
       - .env.app
-    build:
-      context: .
-    image: invoiceninja/invoiceninja-debian:${TAG:-latest}
-    restart: unless-stopped
-        volumes:
-      - ./.env:/var/www/html/.env
-      # - ./php/php.ini:/usr/local/etc/php/conf.d/invoiceninja.ini:ro
-      # - ./php/php-fpm.conf:/usr/local/etc/php-fpm.d/invoiceninja.conf:ro
-      # - ./supervisor/supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
+    environment:
+      # App expects DB_HOST; db creds come from .env.app (DB_* keys)
+      - DB_HOST=mysql
+      - QUEUE_CONNECTION=database
+    volumes:
       - app_public:/var/www/html/public
       - app_storage:/var/www/html/storage
-    networks:
-      - app-network
     depends_on:
       mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - app-network
     logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "php -v >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
 
   nginx:
     image: nginx:alpine
     restart: unless-stopped
-    ports:
-      - "80:80"
+    # DO NOT PUBLISH HOST PORTS IN COOLIFY (Traefik will route by domain)
     volumes:
       - ./nginx:/etc/nginx/conf.d:ro
       - app_public:/var/www/html/public:ro
       - app_storage:/var/www/html/storage:ro
-    networks:
-      - app-network
     depends_on:
       - app
+    networks:
+      - app-network
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+
+  queue:
+    image: invoiceninja/invoiceninja-debian:${TAG:-latest}
+    restart: unless-stopped
+    env_file: [.env.app]
+    environment:
+      - DB_HOST=mysql
+      - QUEUE_CONNECTION=database
+    command: ["php","artisan","queue:work","--sleep=3","--tries=3","--timeout=90"]
+    volumes:
+      - app_storage:/var/www/html/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    networks:
+      - app-network
+    logging: *default-logging
+
+  scheduler:
+    image: invoiceninja/invoiceninja-debian:${TAG:-latest}
+    restart: unless-stopped
+    env_file: [.env.app]
+    environment:
+      - DB_HOST=mysql
+      - QUEUE_CONNECTION=database
+    command: ["sh","-lc","while true; do php artisan schedule:run --verbose --no-interaction; sleep 60; done"]
+    volumes:
+      - app_storage:/var/www/html/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    networks:
+      - app-network
     logging: *default-logging
 
   mysql:
     image: mysql:8
     restart: unless-stopped
+    env_file: [.env.app]
     environment:
       MYSQL_DATABASE: ${DB_DATABASE}
       MYSQL_USER: ${DB_USERNAME}
       MYSQL_PASSWORD: ${DB_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    command: ["mysqld","--character-set-server=utf8mb4","--collation-server=utf8mb4_unicode_ci"]
     volumes:
       - mysql_data:/var/lib/mysql
     networks:
       - app-network
     healthcheck:
-      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER}", "-p${MYSQL_PASSWORD}" ]
+      test: ["CMD","mysqladmin","ping","-h","localhost","-u${MYSQL_USER}","-p${MYSQL_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -70,7 +123,7 @@ services:
     networks:
       - app-network
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD","redis-cli","ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -82,10 +135,6 @@ networks:
 
 volumes:
   app_public:
-    driver: local
   app_storage:
-    driver: local  
   mysql_data:
-    driver: local
   redis_data:
-    driver: local
